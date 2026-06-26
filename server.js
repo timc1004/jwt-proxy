@@ -1,19 +1,46 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { createPublicKey } = require('crypto');
-const fetch = require('node-fetch');
 const { createProxyServer } = require('http-proxy');
 
 const app = express();
-const proxy = createProxyServer();
+const proxy = createProxyServer({
+  proxyTimeout: 30_000,
+  timeout: 30_000,
+});
 
 // ─── Configuration ───────────────────────────────────────────────
 const TARGET_HOST = process.env.TARGET_HOST || 'http://localhost:3000';
 const CLOUDFLARE_JWKS_URL = process.env.CLOUDFLARE_JWKS_URL;
 const CLOUDFLARE_AUD_TOKEN = process.env.CLOUDFLARE_AUD_TOKEN;
+const CLOUDFLARE_ISSUER = process.env.CLOUDFLARE_ISSUER;
 const PORT = process.env.PORT || 8080;
 const JWKS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
+
+function deriveIssuerFromJwksUrl(jwksUrl) {
+  const url = new URL(jwksUrl);
+  if (url.protocol !== 'https:') {
+    throw new Error('CLOUDFLARE_JWKS_URL must use HTTPS');
+  }
+  return `${url.protocol}//${url.host}`;
+}
+
+function resolveIssuer() {
+  if (CLOUDFLARE_ISSUER) {
+    const issuer = new URL(CLOUDFLARE_ISSUER);
+    if (issuer.protocol !== 'https:') {
+      throw new Error('CLOUDFLARE_ISSUER must use HTTPS');
+    }
+    return issuer.origin;
+  }
+  if (!CLOUDFLARE_JWKS_URL) {
+    return null;
+  }
+  return deriveIssuerFromJwksUrl(CLOUDFLARE_JWKS_URL);
+}
+
+const EXPECTED_ISSUER = resolveIssuer();
 
 // ─── Logging ─────────────────────────────────────────────────────
 function log(level, msg, data) {
@@ -40,6 +67,8 @@ async function getJwks() {
   if (!CLOUDFLARE_JWKS_URL) {
     throw new Error('CLOUDFLARE_JWKS_URL is not configured');
   }
+
+  deriveIssuerFromJwksUrl(CLOUDFLARE_JWKS_URL);
 
   log('INFO', 'Fetching JWKS', { url: CLOUDFLARE_JWKS_URL });
 
@@ -72,17 +101,27 @@ function verifyToken(token) {
   if (!decodedHeader) {
     throw new Error('Could not decode JWT header');
   }
+
+  if (decodedHeader.header.alg !== 'RS256') {
+    throw new Error(`Unsupported JWT algorithm: ${decodedHeader.header.alg}`);
+  }
+
   debug('JWT header', { kid: decodedHeader.header.kid, alg: decodedHeader.header.alg });
 
   return fetchKey(decodedHeader.header).then(publicKey => {
     return new Promise((resolve, reject) => {
+      const verifyOptions = {
+        algorithms: ['RS256'],
+        audience: CLOUDFLARE_AUD_TOKEN,
+      };
+      if (EXPECTED_ISSUER) {
+        verifyOptions.issuer = EXPECTED_ISSUER;
+      }
+
       jwt.verify(
         token,
         publicKey,
-        {
-          algorithms: ['RS256'],
-          audience: CLOUDFLARE_AUD_TOKEN,
-        },
+        verifyOptions,
         (err, decoded) => {
           if (err) return reject(err);
           resolve(decoded);
@@ -118,7 +157,7 @@ function extractBearerToken(req) {
 
 // ─── Routes ──────────────────────────────────────────────────────
 app.use(async (req, res, next) => {
-  debug('Incoming request', { method: req.method, path: req.path, ip: req.ip, headers: Object.keys(req.headers) });
+  debug('Incoming request', { method: req.method, path: req.path, ip: req.ip });
 
   // Health check endpoint (no auth required)
   if (req.path === '/healthz') {
@@ -127,14 +166,12 @@ app.use(async (req, res, next) => {
 
   const token = extractBearerToken(req);
   if (!token) {
-    debug('No bearer token found', { authorization: req.headers['authorization'] || '(absent)' });
+    debug('No bearer token found');
     return res.status(403).json({
       error: 'Forbidden',
-      message: 'Missing or malformed Authorization header'
+      message: 'Missing or malformed Authorization header',
     });
   }
-
-  debug('Token received', { token_preview: token.substring(0, 20) + '...' });
 
   try {
     const decoded = await verifyToken(token);
@@ -145,7 +182,7 @@ app.use(async (req, res, next) => {
     log('WARN', 'JWT verification failed', { error: err.message });
     return res.status(403).json({
       error: 'Forbidden',
-      message: err.message
+      message: 'Invalid or expired token',
     });
   }
 });
@@ -156,17 +193,37 @@ app.use((req, res) => {
   proxy.web(req, res, { target: TARGET_HOST, changeOrigin: true }, (err) => {
     if (err) {
       log('ERROR', 'Proxy error', { error: err.message });
-      res.status(502).json({ error: 'Bad Gateway', message: err.message });
+      if (!res.headersSent) {
+        res.status(502).json({ error: 'Bad Gateway', message: 'Upstream request failed' });
+      }
     }
   });
 });
 
 // ─── Start ───────────────────────────────────────────────────────
+function validateConfig() {
+  const missing = [];
+  if (!CLOUDFLARE_JWKS_URL) missing.push('CLOUDFLARE_JWKS_URL');
+  if (!CLOUDFLARE_AUD_TOKEN) missing.push('CLOUDFLARE_AUD_TOKEN');
+  if (missing.length > 0) {
+    throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
+  }
+
+  try {
+    deriveIssuerFromJwksUrl(CLOUDFLARE_JWKS_URL);
+  } catch (err) {
+    throw new Error(`Invalid CLOUDFLARE_JWKS_URL: ${err.message}`);
+  }
+}
+
+validateConfig();
+
 app.listen(PORT, '0.0.0.0', () => {
   log('INFO', `jwt-proxy listening on port ${PORT}`);
   log('INFO', `  TARGET_HOST: ${TARGET_HOST}`);
-  log('INFO', `  CLOUDFLARE_JWKS_URL: ${CLOUDFLARE_JWKS_URL || '(not set)'}`);
-  log('INFO', `  CLOUDFLARE_AUD_TOKEN: ${CLOUDFLARE_AUD_TOKEN ? '***' + CLOUDFLARE_AUD_TOKEN.slice(-6) : '(not set)'}`);
+  log('INFO', `  CLOUDFLARE_JWKS_URL: ${CLOUDFLARE_JWKS_URL}`);
+  log('INFO', `  CLOUDFLARE_AUD_TOKEN: ***${CLOUDFLARE_AUD_TOKEN.slice(-6)}`);
+  log('INFO', `  CLOUDFLARE_ISSUER: ${EXPECTED_ISSUER || '(derived from JWKS URL)'}`);
   log('INFO', `  JWKS cache TTL: ${JWKS_CACHE_TTL_MS / 60000} minutes`);
   log('INFO', `  DEBUG mode: ${DEBUG ? 'on' : 'off'}`);
 });

@@ -1,11 +1,11 @@
 # ─── Build stage ──────────────────────────────────────────────────
-FROM node:20-alpine AS builder
+FROM node:24-alpine AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 # ─── Runtime stage ───────────────────────────────────────────────
-FROM node:20-alpine
+FROM node:24-alpine
 WORKDIR /app
 
 # Security: run as non-root
@@ -22,8 +22,6 @@ EXPOSE 8080
 
 ENV PORT=8080
 ENV TARGET_HOST=http://localhost:3000
-ENV CLOUDFLARE_JWKS_URL=""
-ENV CLOUDFLARE_AUD_TOKEN=""
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:8080/healthz || exit 1

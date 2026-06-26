@@ -10,7 +10,7 @@ A lightweight, open-source reverse proxy that validates Cloudflare Access JWT to
 - **403 on failure** — returns `403 Forbidden` with error details when JWT validation fails
 - **Health check** — exposes `/healthz` (no auth required) for container orchestration
 - **Non-root container** — runs as unprivileged user for security
-- **Tiny image** — ~50MB on `node:20-alpine`
+- **Tiny image** — ~50MB on `node:24-alpine`
 
 ## Quick Start
 
@@ -31,7 +31,9 @@ docker run -d \
 | `TARGET_HOST` | `http://localhost:3000` | Upstream URL to forward authenticated requests to |
 | `CLOUDFLARE_JWKS_URL` | *(required)* | Cloudflare Access JWKS endpoint (e.g. `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`) |
 | `CLOUDFLARE_AUD_TOKEN` | *(required)* | Expected `aud` claim value (your Cloudflare Application Audience) |
+| `CLOUDFLARE_ISSUER` | *(derived from JWKS URL)* | Expected `iss` claim (e.g. `https://your-team.cloudflareaccess.com`) |
 | `PORT` | `8080` | Port the proxy listens on |
+| `DEBUG` | `false` | Enable verbose request/JWT debug logging |
 
 ## Usage
 
