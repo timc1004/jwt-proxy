@@ -14,6 +14,7 @@ const TARGET_HOST = process.env.TARGET_HOST || 'http://localhost:3000';
 const CLOUDFLARE_JWKS_URL = process.env.CLOUDFLARE_JWKS_URL;
 const CLOUDFLARE_AUD_TOKEN = process.env.CLOUDFLARE_AUD_TOKEN;
 const CLOUDFLARE_ISSUER = process.env.CLOUDFLARE_ISSUER;
+const ALLOWED_USERS = process.env.ALLOWED_USERS;
 const PORT = process.env.PORT || 8080;
 const JWKS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
@@ -41,6 +42,41 @@ function resolveIssuer() {
 }
 
 const EXPECTED_ISSUER = resolveIssuer();
+
+// ─── Allowed Users ────────────────────────────────────────────────
+// Parse comma-separated list of email addresses or domains (e.g. "user@example.com,@company.com")
+function parseAllowedUsers(raw) {
+  if (!raw) return null; // no restriction
+  return raw
+    .split(',')
+    .map(e => e.trim().toLowerCase())
+    .filter(e => e.length > 0);
+}
+
+const ALLOWED_USERS_LIST = parseAllowedUsers(ALLOWED_USERS);
+
+function isUserAllowed(email) {
+  if (!ALLOWED_USERS_LIST) return true; // no restriction
+  if (!email) return false;
+
+  const normalizedEmail = email.toLowerCase();
+
+  for (const entry of ALLOWED_USERS_LIST) {
+    if (entry.startsWith('@')) {
+      // Domain match: @company.com matches user@company.com
+      const domain = entry.substring(1);
+      if (normalizedEmail.endsWith(`@${domain}`)) {
+        return true;
+      }
+    } else {
+      // Exact email match
+      if (normalizedEmail === entry) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 // ─── Logging ─────────────────────────────────────────────────────
 function log(level, msg, data) {
@@ -177,6 +213,20 @@ app.use(async (req, res, next) => {
     const decoded = await verifyToken(token);
     req.jwtPayload = decoded;
     debug('JWT verified successfully', { sub: decoded.sub, aud: decoded.aud, exp: decoded.exp });
+
+    // Extract user email from JWT claims
+    // Cloudflare Access uses "email", "identity_nonce", or custom claims
+    const userEmail = decoded.email || decoded.sub || null;
+
+    if (!isUserAllowed(userEmail)) {
+      log('WARN', 'User not in allowed list', { email: userEmail });
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: 'User not authorized',
+      });
+    }
+
+    debug('User authorized', { email: userEmail });
     next();
   } catch (err) {
     log('WARN', 'JWT verification failed', { error: err.message });
@@ -224,6 +274,7 @@ app.listen(PORT, '0.0.0.0', () => {
   log('INFO', `  CLOUDFLARE_JWKS_URL: ${CLOUDFLARE_JWKS_URL}`);
   log('INFO', `  CLOUDFLARE_AUD_TOKEN: ***${CLOUDFLARE_AUD_TOKEN.slice(-6)}`);
   log('INFO', `  CLOUDFLARE_ISSUER: ${EXPECTED_ISSUER || '(derived from JWKS URL)'}`);
+  log('INFO', `  ALLOWED_USERS: ${ALLOWED_USERS_LIST ? ALLOWED_USERS_LIST.join(', ') : '(not set, all users allowed)'}`);
   log('INFO', `  JWKS cache TTL: ${JWKS_CACHE_TTL_MS / 60000} minutes`);
   log('INFO', `  DEBUG mode: ${DEBUG ? 'on' : 'off'}`);
 });
