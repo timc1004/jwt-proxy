@@ -16,8 +16,34 @@ const CLOUDFLARE_AUD_TOKEN = process.env.CLOUDFLARE_AUD_TOKEN;
 const CLOUDFLARE_ISSUER = process.env.CLOUDFLARE_ISSUER;
 const ALLOWED_USERS = process.env.ALLOWED_USERS;
 const PORT = process.env.PORT || 8080;
-const JWKS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const JWKS_CACHE_TTL_MS = parsePositiveIntegerEnv('JWKS_CACHE_TTL_MS', 30 * 60 * 1000); // 30 minutes
+const JWKS_STALE_TTL_MS = parsePositiveIntegerEnv('JWKS_STALE_TTL_MS', 24 * 60 * 60 * 1000); // 24 hours
+const JWKS_FETCH_TIMEOUT_MS = parsePositiveIntegerEnv('JWKS_FETCH_TIMEOUT_MS', 5 * 1000); // 5 seconds
+const WEBHOOK_PATHS = parseList(process.env.WEBHOOK_PATHS).map(normalizePath);
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
+
+function parsePositiveIntegerEnv(name, defaultValue) {
+  const raw = process.env[name];
+  if (!raw) return defaultValue;
+
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+function parseList(raw) {
+  if (!raw) return [];
+  return raw
+    .split(',')
+    .map(e => e.trim())
+    .filter(e => e.length > 0);
+}
+
+function normalizePath(path) {
+  return path.startsWith('/') ? path : `/${path}`;
+}
 
 function deriveIssuerFromJwksUrl(jwksUrl) {
   const url = new URL(jwksUrl);
@@ -92,14 +118,24 @@ function debug(msg, data) {
 // ─── JWKS Cache ──────────────────────────────────────────────────
 let jwksCache = null;
 let jwksCacheTime = 0;
+let jwksRefreshPromise = null;
+let lastJwksError = null;
 
-async function getJwks() {
-  const now = Date.now();
-  if (jwksCache && (now - jwksCacheTime) < JWKS_CACHE_TTL_MS) {
-    debug('JWKS cache hit', { keys: jwksCache.keys?.length, cached_ms_ago: now - jwksCacheTime });
-    return jwksCache;
+function isFreshJwks(now = Date.now()) {
+  return jwksCache && (now - jwksCacheTime) < JWKS_CACHE_TTL_MS;
+}
+
+function isUsableStaleJwks(now = Date.now()) {
+  return jwksCache && (now - jwksCacheTime) < JWKS_STALE_TTL_MS;
+}
+
+function validateJwksShape(jwks) {
+  if (!jwks || !Array.isArray(jwks.keys)) {
+    throw new Error('JWKS response must contain a keys array');
   }
+}
 
+async function fetchJwksFromOrigin() {
   if (!CLOUDFLARE_JWKS_URL) {
     throw new Error('CLOUDFLARE_JWKS_URL is not configured');
   }
@@ -108,28 +144,83 @@ async function getJwks() {
 
   log('INFO', 'Fetching JWKS', { url: CLOUDFLARE_JWKS_URL });
 
-  const res = await fetch(CLOUDFLARE_JWKS_URL);
-  if (!res.ok) {
-    throw new Error(`Failed to fetch JWKS: ${res.status} ${res.statusText}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), JWKS_FETCH_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(CLOUDFLARE_JWKS_URL, { signal: controller.signal });
+    if (!res.ok) {
+      throw new Error(`Failed to fetch JWKS: ${res.status} ${res.statusText}`);
+    }
+
+    const jwks = await res.json();
+    validateJwksShape(jwks);
+    jwksCache = jwks;
+    jwksCacheTime = Date.now();
+    lastJwksError = null;
+    log('INFO', 'JWKS fetched and cached', { keys: jwks.keys.length, ttl_min: JWKS_CACHE_TTL_MS / 60000 });
+    return jwks;
+  } catch (err) {
+    lastJwksError = err;
+    throw err;
+  } finally {
+    clearTimeout(timeout);
   }
-  const jwks = await res.json();
-  jwksCache = jwks;
-  jwksCacheTime = now;
-  log('INFO', 'JWKS fetched and cached', { keys: jwks.keys?.length, ttl_min: JWKS_CACHE_TTL_MS / 60000 });
-  return jwks;
+}
+
+async function refreshJwks() {
+  if (!jwksRefreshPromise) {
+    jwksRefreshPromise = fetchJwksFromOrigin().finally(() => {
+      jwksRefreshPromise = null;
+    });
+  }
+  return jwksRefreshPromise;
+}
+
+async function getJwks(options = {}) {
+  const now = Date.now();
+  if (!options.forceRefresh && isFreshJwks(now)) {
+    debug('JWKS cache hit', { keys: jwksCache.keys.length, cached_ms_ago: now - jwksCacheTime });
+    return jwksCache;
+  }
+
+  try {
+    return await refreshJwks();
+  } catch (err) {
+    if (isUsableStaleJwks(now)) {
+      log('WARN', 'Using stale JWKS after refresh failure', { error: err.message, cached_ms_ago: now - jwksCacheTime });
+      return jwksCache;
+    }
+    throw err;
+  }
 }
 
 // ─── JWT Verification ────────────────────────────────────────────
-function fetchKey(header) {
-  return getJwks().then(jwks => {
-    debug('Looking up key', { kid: header.kid, available_kids: jwks.keys.map(k => k.kid) });
-    const key = jwks.keys.find(k => k.kid === header.kid);
-    if (!key) {
-      throw new Error(`No matching key found for kid: ${header.kid}`);
-    }
-    const keyObject = createPublicKey({ key, format: 'jwk' });
-    return keyObject.export({ format: 'pem', type: 'spki' });
-  });
+function findJwksKey(jwks, kid) {
+  debug('Looking up key', { kid, available_kids: jwks.keys.map(k => k.kid) });
+  return jwks.keys.find(k => k.kid === kid);
+}
+
+function jwkToPem(key) {
+  const keyObject = createPublicKey({ key, format: 'jwk' });
+  return keyObject.export({ format: 'pem', type: 'spki' });
+}
+
+async function fetchKey(header) {
+  const jwks = await getJwks();
+  let key = findJwksKey(jwks, header.kid);
+
+  if (!key) {
+    log('INFO', 'JWT kid not found in cache; refreshing JWKS', { kid: header.kid });
+    const refreshedJwks = await getJwks({ forceRefresh: true });
+    key = findJwksKey(refreshedJwks, header.kid);
+  }
+
+  if (!key) {
+    throw new Error(`No matching key found for kid: ${header.kid}`);
+  }
+
+  return jwkToPem(key);
 }
 
 function verifyToken(token) {
@@ -191,6 +282,51 @@ function extractBearerToken(req) {
   return null;
 }
 
+// ─── Proxy Header Handling ───────────────────────────────────────
+const STRIP_HEADER_NAMES = [
+  'authorization',
+  'cf-access-jwt-assertion',
+  'cf-authorization',
+  'x-authenticated-email',
+  'x-authenticated-user',
+  'x-jwt-proxy-authenticated',
+  'x-jwt-proxy-email',
+  'x-jwt-proxy-sub',
+  'x-jwt-proxy-aud',
+  'x-jwt-proxy-webhook',
+];
+
+function stripSensitiveHeaders(req) {
+  for (const header of STRIP_HEADER_NAMES) {
+    delete req.headers[header];
+  }
+
+  if (req.headers.cookie) {
+    const cookies = req.headers.cookie
+      .split(';')
+      .map(cookie => cookie.trim())
+      .filter(cookie => !cookie.toLowerCase().startsWith('cf_authorization='));
+
+    if (cookies.length > 0) {
+      req.headers.cookie = cookies.join('; ');
+    } else {
+      delete req.headers.cookie;
+    }
+  }
+}
+
+function setTrustedIdentityHeaders(req, decoded) {
+  req.headers['x-jwt-proxy-authenticated'] = 'true';
+  if (decoded.email) req.headers['x-jwt-proxy-email'] = String(decoded.email);
+  if (decoded.sub) req.headers['x-jwt-proxy-sub'] = String(decoded.sub);
+  if (decoded.aud) req.headers['x-jwt-proxy-aud'] = Array.isArray(decoded.aud) ? decoded.aud.join(',') : String(decoded.aud);
+}
+
+// ─── Webhook Paths ───────────────────────────────────────────────
+function isWebhookPath(path) {
+  return WEBHOOK_PATHS.includes(path);
+}
+
 // ─── Routes ──────────────────────────────────────────────────────
 app.use(async (req, res, next) => {
   debug('Incoming request', { method: req.method, path: req.path, ip: req.ip });
@@ -198,6 +334,22 @@ app.use(async (req, res, next) => {
   // Health check endpoint (no auth required)
   if (req.path === '/healthz') {
     return res.status(200).json({ status: 'ok' });
+  }
+
+  if (req.path === '/readyz') {
+    return res.status(200).json({
+      status: lastJwksError && !isUsableStaleJwks() ? 'degraded' : 'ok',
+      jwks: jwksCache ? (isFreshJwks() ? 'fresh' : 'stale') : 'empty',
+      target: TARGET_HOST ? 'configured' : 'missing',
+      webhook_paths: WEBHOOK_PATHS.length,
+    });
+  }
+
+  if (isWebhookPath(req.path)) {
+    debug('Webhook path bypassing JWT auth', { path: req.path });
+    stripSensitiveHeaders(req);
+    req.headers['x-jwt-proxy-webhook'] = 'true';
+    return next();
   }
 
   const token = extractBearerToken(req);
@@ -227,6 +379,8 @@ app.use(async (req, res, next) => {
     }
 
     debug('User authorized', { email: userEmail });
+    stripSensitiveHeaders(req);
+    setTrustedIdentityHeaders(req, decoded);
     next();
   } catch (err) {
     log('WARN', 'JWT verification failed', { error: err.message });
@@ -276,5 +430,8 @@ app.listen(PORT, '0.0.0.0', () => {
   log('INFO', `  CLOUDFLARE_ISSUER: ${EXPECTED_ISSUER || '(derived from JWKS URL)'}`);
   log('INFO', `  ALLOWED_USERS: ${ALLOWED_USERS_LIST ? ALLOWED_USERS_LIST.join(', ') : '(not set, all users allowed)'}`);
   log('INFO', `  JWKS cache TTL: ${JWKS_CACHE_TTL_MS / 60000} minutes`);
+  log('INFO', `  JWKS stale TTL: ${JWKS_STALE_TTL_MS / 60000} minutes`);
+  log('INFO', `  JWKS fetch timeout: ${JWKS_FETCH_TIMEOUT_MS} ms`);
+  log('INFO', `  WEBHOOK_PATHS: ${WEBHOOK_PATHS.length ? WEBHOOK_PATHS.join(', ') : '(not set)'}`);
   log('INFO', `  DEBUG mode: ${DEBUG ? 'on' : 'off'}`);
 });
