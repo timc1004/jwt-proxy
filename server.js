@@ -16,11 +16,29 @@ const CLOUDFLARE_AUD_TOKEN = process.env.CLOUDFLARE_AUD_TOKEN;
 const CLOUDFLARE_ISSUER = process.env.CLOUDFLARE_ISSUER;
 const ALLOWED_USERS = process.env.ALLOWED_USERS;
 const PORT = process.env.PORT || 8080;
-const JWKS_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const BYPASS_PATHS = process.env.BYPASS_PATHS;
 const DEBUG = process.env.DEBUG === 'true' || process.env.DEBUG === '1';
+const DEFAULT_JWKS_CACHE_TTL_MS = 30 * 60 * 1000;
+let JWKS_CACHE_TTL_MS = DEFAULT_JWKS_CACHE_TTL_MS;
+let EXPECTED_ISSUER = null;
+let BYPASS_PATH_PATTERNS = [];
+
+function parsePositiveIntegerEnv(name, defaultValue) {
+  const raw = process.env[name];
+  if (!raw || raw.trim() === '') {
+    return defaultValue;
+  }
+
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+
+  return parsed;
+}
 
 function deriveIssuerFromJwksUrl(jwksUrl) {
-  const url = new URL(jwksUrl);
+  const url = new URL(jwksUrl.trim());
   if (url.protocol !== 'https:') {
     throw new Error('CLOUDFLARE_JWKS_URL must use HTTPS');
   }
@@ -28,20 +46,18 @@ function deriveIssuerFromJwksUrl(jwksUrl) {
 }
 
 function resolveIssuer() {
-  if (CLOUDFLARE_ISSUER) {
-    const issuer = new URL(CLOUDFLARE_ISSUER);
+  if (CLOUDFLARE_ISSUER && CLOUDFLARE_ISSUER.trim() !== '') {
+    const issuer = new URL(CLOUDFLARE_ISSUER.trim());
     if (issuer.protocol !== 'https:') {
       throw new Error('CLOUDFLARE_ISSUER must use HTTPS');
     }
     return issuer.origin;
   }
-  if (!CLOUDFLARE_JWKS_URL) {
+  if (!CLOUDFLARE_JWKS_URL || CLOUDFLARE_JWKS_URL.trim() === '') {
     return null;
   }
   return deriveIssuerFromJwksUrl(CLOUDFLARE_JWKS_URL);
 }
-
-const EXPECTED_ISSUER = resolveIssuer();
 
 // ─── Allowed Users ────────────────────────────────────────────────
 // Parse comma-separated list of email addresses or domains (e.g. "user@example.com,@company.com")
@@ -54,6 +70,40 @@ function parseAllowedUsers(raw) {
 }
 
 const ALLOWED_USERS_LIST = parseAllowedUsers(ALLOWED_USERS);
+
+// ─── Bypass Paths ────────────────────────────────────────────────
+// BYPASS_PATHS supports either a JSON array (recommended) or a comma-separated list.
+// Each entry is treated as a JavaScript regular expression matched against req.path.
+function parseBypassPaths(raw) {
+  if (!raw || raw.trim() === '') return [];
+
+  let entries;
+  try {
+    entries = JSON.parse(raw);
+  } catch (err) {
+    entries = raw.split(',').map(path => path.trim()).filter(Boolean);
+  }
+
+  if (!Array.isArray(entries)) {
+    throw new Error('BYPASS_PATHS must be a JSON array of regex strings or a comma-separated list');
+  }
+
+  return entries.map((entry) => {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      throw new Error('BYPASS_PATHS entries must be non-empty strings');
+    }
+
+    try {
+      return new RegExp(entry);
+    } catch (err) {
+      throw new Error(`Invalid BYPASS_PATHS regex "${entry}": ${err.message}`);
+    }
+  });
+}
+
+function isBypassPath(path) {
+  return BYPASS_PATH_PATTERNS.some(pattern => pattern.test(path));
+}
 
 function isUserAllowed(email) {
   if (!ALLOWED_USERS_LIST) return true; // no restriction
@@ -93,46 +143,81 @@ function debug(msg, data) {
 let jwksCache = null;
 let jwksCacheTime = 0;
 
-async function getJwks() {
+function validateJwks(jwks) {
+  if (!jwks || typeof jwks !== 'object' || !Array.isArray(jwks.keys) || jwks.keys.length === 0) {
+    throw new Error('JWKS response must include a non-empty keys array');
+  }
+
+  for (const key of jwks.keys) {
+    if (!key || typeof key !== 'object' || typeof key.kid !== 'string' || key.kid.trim() === '') {
+      throw new Error('Each JWKS key must include a non-empty kid');
+    }
+
+    try {
+      createPublicKey({ key, format: 'jwk' });
+    } catch (err) {
+      throw new Error(`Invalid JWKS key for kid "${key.kid}": ${err.message}`);
+    }
+  }
+}
+
+async function getJwks({ forceRefresh = false } = {}) {
   const now = Date.now();
-  if (jwksCache && (now - jwksCacheTime) < JWKS_CACHE_TTL_MS) {
+  if (!forceRefresh && jwksCache && (now - jwksCacheTime) < JWKS_CACHE_TTL_MS) {
     debug('JWKS cache hit', { keys: jwksCache.keys?.length, cached_ms_ago: now - jwksCacheTime });
     return jwksCache;
   }
 
-  if (!CLOUDFLARE_JWKS_URL) {
+  if (!CLOUDFLARE_JWKS_URL || CLOUDFLARE_JWKS_URL.trim() === '') {
     throw new Error('CLOUDFLARE_JWKS_URL is not configured');
   }
 
   deriveIssuerFromJwksUrl(CLOUDFLARE_JWKS_URL);
 
-  log('INFO', 'Fetching JWKS', { url: CLOUDFLARE_JWKS_URL });
+  log('INFO', 'Fetching JWKS', { url: CLOUDFLARE_JWKS_URL, force_refresh: forceRefresh });
 
-  const res = await fetch(CLOUDFLARE_JWKS_URL);
+  const res = await fetch(CLOUDFLARE_JWKS_URL.trim());
   if (!res.ok) {
     throw new Error(`Failed to fetch JWKS: ${res.status} ${res.statusText}`);
   }
   const jwks = await res.json();
+  validateJwks(jwks);
   jwksCache = jwks;
-  jwksCacheTime = now;
+  jwksCacheTime = Date.now();
   log('INFO', 'JWKS fetched and cached', { keys: jwks.keys?.length, ttl_min: JWKS_CACHE_TTL_MS / 60000 });
   return jwks;
 }
 
 // ─── JWT Verification ────────────────────────────────────────────
-function fetchKey(header) {
-  return getJwks().then(jwks => {
-    debug('Looking up key', { kid: header.kid, available_kids: jwks.keys.map(k => k.kid) });
-    const key = jwks.keys.find(k => k.kid === header.kid);
-    if (!key) {
-      throw new Error(`No matching key found for kid: ${header.kid}`);
-    }
-    const keyObject = createPublicKey({ key, format: 'jwk' });
-    return keyObject.export({ format: 'pem', type: 'spki' });
-  });
+function findKey(jwks, kid) {
+  return jwks.keys.find(k => k.kid === kid);
 }
 
-function verifyToken(token) {
+async function fetchKey(header) {
+  if (!header.kid) {
+    throw new Error('JWT header is missing kid');
+  }
+
+  let jwks = await getJwks();
+  debug('Looking up key', { kid: header.kid, available_kids: jwks.keys.map(k => k.kid) });
+
+  let key = findKey(jwks, header.kid);
+  if (!key) {
+    log('INFO', 'JWT kid not found in cached JWKS, refreshing', { kid: header.kid });
+    jwks = await getJwks({ forceRefresh: true });
+    debug('Looking up key after refresh', { kid: header.kid, available_kids: jwks.keys.map(k => k.kid) });
+    key = findKey(jwks, header.kid);
+  }
+
+  if (!key) {
+    throw new Error(`No matching key found for kid: ${header.kid}`);
+  }
+
+  const keyObject = createPublicKey({ key, format: 'jwk' });
+  return keyObject.export({ format: 'pem', type: 'spki' });
+}
+
+async function verifyToken(token) {
   const decodedHeader = jwt.decode(token, { complete: true });
   if (!decodedHeader) {
     throw new Error('Could not decode JWT header');
@@ -144,26 +229,26 @@ function verifyToken(token) {
 
   debug('JWT header', { kid: decodedHeader.header.kid, alg: decodedHeader.header.alg });
 
-  return fetchKey(decodedHeader.header).then(publicKey => {
-    return new Promise((resolve, reject) => {
-      const verifyOptions = {
-        algorithms: ['RS256'],
-        audience: CLOUDFLARE_AUD_TOKEN,
-      };
-      if (EXPECTED_ISSUER) {
-        verifyOptions.issuer = EXPECTED_ISSUER;
-      }
+  const publicKey = await fetchKey(decodedHeader.header);
 
-      jwt.verify(
-        token,
-        publicKey,
-        verifyOptions,
-        (err, decoded) => {
-          if (err) return reject(err);
-          resolve(decoded);
-        }
-      );
-    });
+  return new Promise((resolve, reject) => {
+    const verifyOptions = {
+      algorithms: ['RS256'],
+      audience: CLOUDFLARE_AUD_TOKEN,
+    };
+    if (EXPECTED_ISSUER) {
+      verifyOptions.issuer = EXPECTED_ISSUER;
+    }
+
+    jwt.verify(
+      token,
+      publicKey,
+      verifyOptions,
+      (err, decoded) => {
+        if (err) return reject(err);
+        resolve(decoded);
+      }
+    );
   });
 }
 
@@ -198,6 +283,11 @@ app.use(async (req, res, next) => {
   // Health check endpoint (no auth required)
   if (req.path === '/healthz') {
     return res.status(200).json({ status: 'ok' });
+  }
+
+  if (isBypassPath(req.path)) {
+    debug('Bypassing JWT verification', { path: req.path });
+    return next();
   }
 
   const token = extractBearerToken(req);
@@ -253,8 +343,8 @@ app.use((req, res) => {
 // ─── Start ───────────────────────────────────────────────────────
 function validateConfig() {
   const missing = [];
-  if (!CLOUDFLARE_JWKS_URL) missing.push('CLOUDFLARE_JWKS_URL');
-  if (!CLOUDFLARE_AUD_TOKEN) missing.push('CLOUDFLARE_AUD_TOKEN');
+  if (!CLOUDFLARE_JWKS_URL || CLOUDFLARE_JWKS_URL.trim() === '') missing.push('CLOUDFLARE_JWKS_URL');
+  if (!CLOUDFLARE_AUD_TOKEN || CLOUDFLARE_AUD_TOKEN.trim() === '') missing.push('CLOUDFLARE_AUD_TOKEN');
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
@@ -264,17 +354,33 @@ function validateConfig() {
   } catch (err) {
     throw new Error(`Invalid CLOUDFLARE_JWKS_URL: ${err.message}`);
   }
+
+  JWKS_CACHE_TTL_MS = parsePositiveIntegerEnv('JWKS_CACHE_TTL_MS', DEFAULT_JWKS_CACHE_TTL_MS);
+  EXPECTED_ISSUER = resolveIssuer();
+  BYPASS_PATH_PATTERNS = parseBypassPaths(BYPASS_PATHS);
 }
 
-validateConfig();
+async function start() {
+  try {
+    validateConfig();
+    await getJwks({ forceRefresh: true });
+  } catch (err) {
+    log('ERROR', 'Startup failed', { error: err.message });
+    process.exitCode = 1;
+    return;
+  }
 
-app.listen(PORT, '0.0.0.0', () => {
-  log('INFO', `jwt-proxy listening on port ${PORT}`);
-  log('INFO', `  TARGET_HOST: ${TARGET_HOST}`);
-  log('INFO', `  CLOUDFLARE_JWKS_URL: ${CLOUDFLARE_JWKS_URL}`);
-  log('INFO', `  CLOUDFLARE_AUD_TOKEN: ***${CLOUDFLARE_AUD_TOKEN.slice(-6)}`);
-  log('INFO', `  CLOUDFLARE_ISSUER: ${EXPECTED_ISSUER || '(derived from JWKS URL)'}`);
-  log('INFO', `  ALLOWED_USERS: ${ALLOWED_USERS_LIST ? ALLOWED_USERS_LIST.join(', ') : '(not set, all users allowed)'}`);
-  log('INFO', `  JWKS cache TTL: ${JWKS_CACHE_TTL_MS / 60000} minutes`);
-  log('INFO', `  DEBUG mode: ${DEBUG ? 'on' : 'off'}`);
-});
+  app.listen(PORT, '0.0.0.0', () => {
+    log('INFO', `jwt-proxy listening on port ${PORT}`);
+    log('INFO', `  TARGET_HOST: ${TARGET_HOST}`);
+    log('INFO', `  CLOUDFLARE_JWKS_URL: ${CLOUDFLARE_JWKS_URL}`);
+    log('INFO', `  CLOUDFLARE_AUD_TOKEN: ***${CLOUDFLARE_AUD_TOKEN.slice(-6)}`);
+    log('INFO', `  CLOUDFLARE_ISSUER: ${EXPECTED_ISSUER || '(derived from JWKS URL)'}`);
+    log('INFO', `  ALLOWED_USERS: ${ALLOWED_USERS_LIST ? ALLOWED_USERS_LIST.join(', ') : '(not set, all users allowed)'}`);
+    log('INFO', `  BYPASS_PATHS: ${BYPASS_PATH_PATTERNS.length ? BYPASS_PATH_PATTERNS.map(pattern => pattern.source).join(', ') : '(not set)'}`);
+    log('INFO', `  JWKS cache TTL: ${JWKS_CACHE_TTL_MS / 60000} minutes`);
+    log('INFO', `  DEBUG mode: ${DEBUG ? 'on' : 'off'}`);
+  });
+}
+
+start();

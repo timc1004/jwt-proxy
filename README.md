@@ -32,6 +32,8 @@ docker run -d \
 | `CLOUDFLARE_JWKS_URL` | *(required)* | Cloudflare Access JWKS endpoint (e.g. `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`) |
 | `CLOUDFLARE_AUD_TOKEN` | *(required)* | Expected `aud` claim value (your Cloudflare Application Audience) |
 | `CLOUDFLARE_ISSUER` | *(derived from JWKS URL)* | Expected `iss` claim (e.g. `https://your-team.cloudflareaccess.com`) |
+| `JWKS_CACHE_TTL_MS` | `1800000` | JWKS cache TTL in milliseconds |
+| `BYPASS_PATHS` | *(not set)* | JSON array of JavaScript regex strings for paths that skip JWT verification (e.g. `["^/public/","^/webhook$"]`) |
 | `PORT` | `8080` | Port the proxy listens on |
 | `DEBUG` | `false` | Enable verbose request/JWT debug logging |
 
