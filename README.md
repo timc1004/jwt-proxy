@@ -103,6 +103,8 @@ See [Cloudflare Tunnel setup](https://developers.cloudflare.com/tunnel/get-start
 | `CLOUDFLARE_ISSUER` | *(derived from JWKS URL)* | Expected `iss` claim (e.g. `https://your-team.cloudflareaccess.com`) |
 | `JWKS_CACHE_TTL_MS` | `1800000` | JWKS cache TTL in milliseconds |
 | `ALLOWED_USERS` | *(not set)* | Optional comma-separated email/domain allowlist, e.g. `user@example.com,@company.com`; otherwise any valid token for this application is accepted |
+| `JWKS_FETCH_TIMEOUT_MS` | `5000` | Timeout for fetching JWKS headers and response body |
+| `JWKS_REFRESH_COOLDOWN_MS` | `30000` | Minimum interval between completed refresh attempts, including failures |
 | `BYPASS_PATHS` | *(not set)* | JSON array of JavaScript regex strings for paths that skip JWT verification (e.g. `["^/public/","^/webhook$"]`) |
 | `PORT` | `8080` | Port the proxy listens on |
 | `DEBUG` | `false` | Enable verbose request/JWT debug logging |
@@ -148,13 +150,19 @@ Client (Cloudflare Access)
 - Leave `BYPASS_PATHS` unset unless an endpoint is intentionally public. Expressions match the raw request path; use anchors and check URL encoding, dot segments, and upstream path normalization before allowing bypasses.
 - The proxy forwards original request headers. Upstream applications must not trust client-supplied identity headers such as `Cf-Access-Authenticated-User-Email` or `X-Forwarded-User` as proof of identity; this proxy does not replace them with verified JWT claims.
 - JWT expiry is checked when `exp` exists, but the current verifier does not require that claim. It also does not explicitly require Cloudflare's application token type.
-- An unknown JWT `kid` forces a JWKS refresh. Fetches currently have no explicit timeout, refresh cooldown, or in-flight deduplication; unauthenticated requests can create excessive outbound requests and resource pressure. Keep Access policies enforced at the edge and restrict direct origin access.
+- Unknown JWT key IDs can request a JWKS refresh, but all callers share a single in-flight fetch. Fetches time out after five seconds and refresh attempts are throttled for 30 seconds after completion, including failures. Valid cached keys remain usable until their TTL expires; expired keys fail closed if a refresh is unavailable. A newly rotated key may be rejected until the cooldown ends. Keep Access policies enforced at the edge and restrict direct origin access.
 - Keep `DEBUG` disabled in production unless diagnosing an issue; logs can include user identities and request paths.
 
 ## Building Locally
 
 ```bash
 docker build -t jwt-proxy .
+```
+
+## Regression checks
+
+```bash
+node --test jwks-cache.test.js
 ```
 
 ## License

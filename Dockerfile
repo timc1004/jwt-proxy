@@ -13,7 +13,7 @@ RUN addgroup -g 1001 -S appgroup && \
     adduser -u 1001 -S appuser -G appgroup
 
 COPY --from=builder /app/node_modules ./node_modules
-COPY server.js ./
+COPY server.js jwks-cache.js ./
 
 # Drop privileges
 USER appuser

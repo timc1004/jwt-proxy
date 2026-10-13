@@ -1,4 +1,5 @@
 const express = require('express');
+const { createJwksCache } = require('./jwks-cache');
 const jwt = require('jsonwebtoken');
 const { createPublicKey } = require('crypto');
 const { createProxyServer } = require('http-proxy');
@@ -140,8 +141,7 @@ function debug(msg, data) {
 }
 
 // ─── JWKS Cache ──────────────────────────────────────────────────
-let jwksCache = null;
-let jwksCacheTime = 0;
+let getJwks;
 
 function validateJwks(jwks) {
   if (!jwks || typeof jwks !== 'object' || !Array.isArray(jwks.keys) || jwks.keys.length === 0) {
@@ -161,40 +161,13 @@ function validateJwks(jwks) {
   }
 }
 
-async function getJwks({ forceRefresh = false } = {}) {
-  const now = Date.now();
-  if (!forceRefresh && jwksCache && (now - jwksCacheTime) < JWKS_CACHE_TTL_MS) {
-    debug('JWKS cache hit', { keys: jwksCache.keys?.length, cached_ms_ago: now - jwksCacheTime });
-    return jwksCache;
-  }
-
-  if (!CLOUDFLARE_JWKS_URL || CLOUDFLARE_JWKS_URL.trim() === '') {
-    throw new Error('CLOUDFLARE_JWKS_URL is not configured');
-  }
-
-  deriveIssuerFromJwksUrl(CLOUDFLARE_JWKS_URL);
-
-  log('INFO', 'Fetching JWKS', { url: CLOUDFLARE_JWKS_URL, force_refresh: forceRefresh });
-
-  const res = await fetch(CLOUDFLARE_JWKS_URL.trim());
-  if (!res.ok) {
-    throw new Error(`Failed to fetch JWKS: ${res.status} ${res.statusText}`);
-  }
-  const jwks = await res.json();
-  validateJwks(jwks);
-  jwksCache = jwks;
-  jwksCacheTime = Date.now();
-  log('INFO', 'JWKS fetched and cached', { keys: jwks.keys?.length, ttl_min: JWKS_CACHE_TTL_MS / 60000 });
-  return jwks;
-}
-
 // ─── JWT Verification ────────────────────────────────────────────
 function findKey(jwks, kid) {
   return jwks.keys.find(k => k.kid === kid);
 }
 
 async function fetchKey(header) {
-  if (!header.kid) {
+  if (typeof header.kid !== 'string' || !header.kid || header.kid.length > 256) {
     throw new Error('JWT header is missing kid');
   }
 
@@ -356,6 +329,13 @@ function validateConfig() {
   }
 
   JWKS_CACHE_TTL_MS = parsePositiveIntegerEnv('JWKS_CACHE_TTL_MS', DEFAULT_JWKS_CACHE_TTL_MS);
+  getJwks = createJwksCache({
+    url: CLOUDFLARE_JWKS_URL.trim(),
+    ttlMs: JWKS_CACHE_TTL_MS,
+    timeoutMs: parsePositiveIntegerEnv('JWKS_FETCH_TIMEOUT_MS', 5000),
+    cooldownMs: parsePositiveIntegerEnv('JWKS_REFRESH_COOLDOWN_MS', 30000),
+    validate: validateJwks,
+  });
   EXPECTED_ISSUER = resolveIssuer();
   BYPASS_PATH_PATTERNS = parseBypassPaths(BYPASS_PATHS);
 }
